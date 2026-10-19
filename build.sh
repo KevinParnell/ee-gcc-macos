@@ -1,16 +1,15 @@
 #!/bin/sh
-# Build EE-GCC 2.9-ee-991111-01 (driver, cpp, cc1 and the EE assembler) natively for macOS with Apple clang,
-# from GirianSeed/ee-gcc's copy of Sony's source release, and check it against the original compiler.
+# Build EE-GCC 2.9-ee-991111-01 (driver, cpp, cc1, cc1plus and the EE assembler) natively for macOS with Apple
+# clang, from GirianSeed/ee-gcc's copy of Sony's source release, and check it against the original compiler.
 #
 #   ./build.sh WORKDIR [PREFIX]
 #
 # WORKDIR holds the download, the sources and the build (about 600 MB); PREFIX gets the install (default
 # WORKDIR/ee-gcc-2.9-ee-991111-01), laid out like decomp.wtf's Linux package so the driver finds its tools:
-#   bin/ee-gcc, lib/gcc-lib/ee/2.9-ee-991111-01/{cc1,cpp}, ee/bin/as
-# C only: the C++ front end (cc1plus) is not ported yet (see README.md), so it isn't built.
-# The last step compiles a test file and compares the objects with ones made by the original Linux
-# compiler (sha256 below); the build fails if they differ. ARCH=x86_64 builds for Intel Macs instead
-# (on Apple Silicon that runs under Rosetta); that build is not verified, see README.md.
+#   bin/ee-gcc, lib/gcc-lib/ee/2.9-ee-991111-01/{cc1,cc1plus,cpp}, ee/bin/as
+# The last step compiles a C and a C++ test file and compares the objects with ones made by the original
+# Linux compiler (sha256 below); the build fails if they differ. ARCH=x86_64 builds for Intel Macs instead
+# (on Apple Silicon that runs under Rosetta).
 # The binaries run on macOS 11 or newer (MACOSX_DEPLOYMENT_TARGET overrides that).
 set -eu
 
@@ -20,8 +19,11 @@ VERSION=2.9-ee-991111-01
 # objects the original (decomp.wtf's ee-gcc-2.9-991111-01, run in Linux) makes from tools/selftest.c
 SELFTEST_O2_G0=c4b930a7ab20671175c18e6a65e42aab8e67d4890eff338b65c9c7ce033bb352
 SELFTEST_O0_G8=29780e3978abdc0676fbc41370d4c15cbf8970a8baa3981b5d2c26cf46c84f34
+# and from tools/selftest.cc
+SELFTEST_CXX_O2_G0=75a3b13da7d393f8ceeccd91e4b52fe7f866ba7b1efbb9538ae7fb7662fbc158
+SELFTEST_CXX_O0_G8=df536d65222652cd23d5638d20d5efdbc12542942fb6a489d577fbfd33df3527
 
-[ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 2; }
 here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$1"; work=$(cd "$1" && pwd)
 out=${2:-$work/ee-gcc-$VERSION}
@@ -63,8 +65,11 @@ rm -rf "$work/src/gdb"
 cp "$here/$VERSION/xm-darwin.h" "$work/src/gcc/config/"
 
 echo "== configure ($host)"
-mkdir -p "$work/build" && cd "$work/build"
-CC="$CC" CFLAGS="$CFLAGS" ../src/configure --prefix=/usr/local/sce/ee/gcc --host=$host --build=$host --target=ee \
+# Build in a directory inside the source tree, as the original was: abort () prints __FILE__, which is then
+# ../../gcc/expr.c and not ../../src/gcc/expr.c (and the assembler's BFD assertions ../../bfd/...).
+obj=$work/src/obj
+mkdir -p "$obj" && cd "$obj"
+CC="$CC" CFLAGS="$CFLAGS" ../configure --prefix=/usr/local/sce/ee/gcc --host=$host --build=$host --target=ee \
   --enable-c-cpplib --without-sim --disable-sim >configure.log 2>&1 || { tail -20 configure.log; exit 1; }
 
 grep -q 'MASK_MIPS5900|20))' gcc/tm.h || { echo "unexpected TARGET_CPU_DEFAULT: $(cat gcc/tm.h | head -1)" >&2; exit 1; }
@@ -73,15 +78,15 @@ echo "== build"
 for d in bison libiberty intl bfd opcodes gas; do
   (cd $d && make -j"$jobs" CC="$CC" CFLAGS="$CFLAGS" >make.log 2>&1) || { tail -20 $d/make.log; exit 1; }
 done
-# The C parser comes from the in-tree bison 1.25, as in Sony's build.
-(cd gcc && make -j"$jobs" CC="$CC" CFLAGS="$CFLAGS" BISON="$work/build/bison/bison -L $work/src/bison/" \
-  cpp cc1 xgcc >make.log 2>&1) || { tail -20 gcc/make.log; exit 1; }
+# The C and C++ parsers come from the in-tree bison 1.25, as in Sony's build (the source has no parse.c).
+(cd gcc && make -j"$jobs" CC="$CC" CFLAGS="$CFLAGS" BISON="$obj/bison/bison -L $work/src/bison/" \
+  cpp cc1 cc1plus xgcc >make.log 2>&1) || { tail -20 gcc/make.log; exit 1; }
 
 echo "== install to $out"
 rm -rf "$out"
 mkdir -p "$out/bin" "$out/lib/gcc-lib/ee/$VERSION" "$out/ee/bin"
 cp gcc/xgcc "$out/bin/ee-gcc"
-cp gcc/cc1 gcc/cpp "$out/lib/gcc-lib/ee/$VERSION/"
+cp gcc/cc1 gcc/cc1plus gcc/cpp "$out/lib/gcc-lib/ee/$VERSION/"
 cp gas/as-new "$out/ee/bin/as"
 cp "$work/src/COPYING" "$work/src/COPYING.LIB" "$out/"
 cat >"$out/SOURCE.txt" <<EOF
@@ -93,11 +98,15 @@ and $VERSION/xm-darwin.h from that repository. GPL-2.0: see COPYING.
 EOF
 
 echo "== self-test against the original compiler"
-st=$work/selftest; rm -rf "$st"; mkdir -p "$st"; cp "$here/tools/selftest.c" "$st/"
+st=$work/selftest; rm -rf "$st"; mkdir -p "$st"; cp "$here/tools/selftest.c" "$here/tools/selftest.cc" "$st/"
 cd "$st"
-LC_ALL=C "$out/bin/ee-gcc" -O2 -G0 -c selftest.c -o O2G0.o
-LC_ALL=C "$out/bin/ee-gcc" -O0 -G8 -c selftest.c -o O0G8.o
-[ "$(shasum -a 256 O2G0.o | cut -d' ' -f1)" = $SELFTEST_O2_G0 ] || { echo "self-test FAILED (-O2 -G0)" >&2; exit 1; }
-[ "$(shasum -a 256 O0G8.o | cut -d' ' -f1)" = $SELFTEST_O0_G8 ] || { echo "self-test FAILED (-O0 -G8)" >&2; exit 1; }
+check() {  # check SOURCE FLAGS SHA256
+  LC_ALL=C "$out/bin/ee-gcc" $2 -c "$1" -o test.o
+  [ "$(shasum -a 256 test.o | cut -d' ' -f1)" = "$3" ] || { echo "self-test FAILED ($1 $2)" >&2; exit 1; }
+}
+check selftest.c "-O2 -G0" $SELFTEST_O2_G0
+check selftest.c "-O0 -G8" $SELFTEST_O0_G8
+check selftest.cc "-O2 -G0" $SELFTEST_CXX_O2_G0
+check selftest.cc "-O0 -G8" $SELFTEST_CXX_O0_G8
 "$out/bin/ee-gcc" --version | head -1
 echo "ok: $out"

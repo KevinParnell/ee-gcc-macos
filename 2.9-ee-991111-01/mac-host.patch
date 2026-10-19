@@ -1,6 +1,6 @@
 Host port of EE-GCC 2.9-ee-991111-01 (GirianSeed/ee-gcc src.tar.gz + Sony's sce-patch) to 64-bit macOS,
-built with Apple clang: arm64 (x86_64 builds but is not verified). Apply with `patch -p1` in src/, then copy
-xm-darwin.h to gcc/config/. What each part is for:
+built with Apple clang, for arm64 and x86_64. Apply with `patch -p1` in src/, then copy xm-darwin.h to
+gcc/config/. What each part is for:
 
 1. config.sub, gcc/config.sub, gcc/configure: accept aarch64/x86_64-apple-darwin hosts (xm-darwin.h).
 2. libiberty/strerror.c: hide the SDK's `const int sys_nerr` like sys_errlist. include/obstack.h: no lvalue
@@ -24,7 +24,84 @@ xm-darwin.h to gcc/config/. What each part is for:
    - gcc/loop.c find_and_verify_loops(): a LOOP_CONT note outside any loop was stored at
      loop_number_loop_cont[-1]. In the original's packed alloca blocks (n * 4 bytes each, seen in its
      disassembly) that is loop_number_cont_dominator[max_loop_num - 1]; it is stored there now.
-
+6. The C++ front end (cc1plus):
+   - gcc/cp/cp-tree.h, gcc/cp/errfn.c, gcc/cp/typeck2.c: cp_error, cp_warning, cp_pedwarn and the rest are
+     variadic, but cp-tree.h declared them `()', so all 826 calls passed their arguments in registers while
+     the callee read them from the stack (most diagnostics crashed cc1plus). They are prototyped now. errfn.c
+     calls error, warning, pedwarn and their _with_file_and_line forms (variadic) and compiler_error (K&R)
+     through one unprototyped pointer: each is now called the way it is defined. typeck2.c's readonly_error
+     kept cp_error/cp_pedwarn in an unprototyped pointer.
+   - gcc/cp/decl.c grokdeclarator(): `next = &name' pointed at a block-local variable that the loop read
+     after the block had ended (found by AddressSanitizer). The original's stack slot still held it.
+   - gcc/cp/call.c add_function_candidate(): CONVS was uninitialised on the not-viable path. Clang treats
+     passing an uninitialised value as undefined and deleted that path, so non-viable candidates became
+     viable (`foo f;' was ambiguous with the copy constructor).
+   - gcc/cp/cp-tree.h IS_SIGNATURE: a pointer to member function type keeps its RECORD_TYPE in
+     TYPE_LANG_SPECIFIC, and IS_SIGNATURE read a struct lang_type bit from that tree: the low byte of its
+     (null) TREE_TYPE on the original, part of a TREE_CHAIN address on a 64-bit host, which made
+     `(int (A::*)()) 0' a "signature type" on x86_64. Only class types are checked now.
+   - gcc/cp/rtti.c build_x_typeid(): NONNULL was uninitialised, and only ever set to 1. In the original it
+     was never 0 in any test, so `typeid (*p)' got no null check; it starts at 1 now instead of holding
+     whatever the port's stack has (0 adds a call to __throw_bad_typeid).
+   - gcc/cp/decl2.c, gcc/cp/pt.c, gcc/cp/typeck.c: the order of evaluation of call arguments. The original
+     was built with GCC 2.7.2 on i386, which evaluates them right to left; clang goes left to right. Where
+     two arguments instantiate templates (build_expr_from_tree, tsubst_copy, tsubst_expr) or may synthesize
+     methods and give diagnostics (rationalize_conditional_expr, build_component_ref, build_modify_expr),
+     the later arguments are computed first, so templates are instantiated, and their functions output, in
+     the original's order (g++.pt/sizeof.C: bar<15> before bar<8>).
+   - LONG32 again: cp/typeck.c and c-typeck.c (the -Wsign-compare "promoted ~unsigned" check stops at a
+     32-bit `long'), cp/typeck2.c (an enum value printed through a 32-bit `long'), cp/error.c (a 128-bit
+     constant printed with "%x%08x" and two 64-bit words: i386 printed the two halves of the high word).
+7. gcc/except.c, exception handling (shared with C -fexceptions):
+   - remove_handler() compared handler labels by pointer, also for regions of functions already compiled,
+     whose labels' memory has been freed and reused: a new label at the same address removed an unrelated
+     handler and its exception table entry. Where that happens depends on the host's object sizes, so it
+     compares the (unique) label numbers now.
+   - get_first_handler() read function_eh_regions[-1] for a region it couldn't find. On the original that
+     is the malloc chunk header, and following it crashed the compiler with SIGSEGV. It raises SIGSEGV now,
+     so the messages are the same (cc1plus's "Internal compiler error.", or the driver's for cc1).
+8. gcc/sibcall.c optimize_sibling_and_tail_recursive_calls() called find_basic_blocks with 3 of its 4
+   arguments (it is undeclared there), so DO_CLEANUP was whatever lay in its place: in the port, a register
+   left over from jump_optimize_minimal, 0 or not depending on how jump.c was compiled (x86_64 kept dead
+   inlined loops: c-torture 960209-1.c at -O3). On the original it was INSNS, still on the stack from the
+   call before (GCC defers the pop), so never 0. It passes 1.
+9. gcc/tree.c append_random_chars(): a C++ file that defines no global object names its EH frame function
+   and anonymous namespaces after the file plus 6 characters from the time of day and the pid, so the
+   original never gives the same object twice. The port adds 0 instead, which is what the original adds
+   when tools/fixed-clock.so is preloaded (its gettimeofday returns tv_sec = pid, tv_usec = 0). With that
+   the original is reproducible too, and both give the same names.
+10. Found by comparing the -da dumps with the original's:
+   - Argument order (see 6) in the back end, where one argument can make a pseudo or emit an insn before
+     another: gcc/expr.c emit_move_insn_1 (complex moves; g++.brendan complex1.C's RTL numbered the two
+     addresses the other way round), expand_expr (complex conjugate, highpart multiply),
+     expand_builtin_apply_args, do_jump_by_parts_equality; gcc/optabs.c expand_binop,
+     expand_twoval_binop; gcc/function.c assign_parms; gcc/integrate.c copy_rtx_and_substitute (inlined
+     calls); gcc/config/mips/mips.c expand_block_move; gcc/config/mips/mips.md mulsi3, mulsidi3,
+     umulsidi3 (three gen_reg_rtx in one argument list); gcc/combine.c simplify_and_const_int;
+     gcc/c-common.c truthvalue_conversion.
+   - gcc/haifa-sched.c get_visual_tbl_length(): "  %33s" wrote 36 bytes into alloca (35); the original's
+     alloca rounded to 36, the port's fortified sprintf aborted every -da compile that scheduled.
+     print_value() printed CONST_DOUBLE words through a 32-bit `long' (LONG32).
+11. Error recovery of rejected code, so the messages are the same:
+   - gcc/cp/decl.c init_decl_processing(): error recovery reads fields that an ERROR_MARK node lacks. On the
+     original the 12-byte error_mark_node was followed by error_mark_list and this_identifier, so those
+     reads found their fields; here they found other nodes' fields. error_mark_node now has room for every
+     field, holding what the original read in those that g++ tests reach: TREE_OPERAND 0 is
+     error_mark_node (build_new_1 after a failed operator new: g++.jason/dtor3.C and 6 more), DECL_CONTEXT
+     is 4 (g++.brendan/crash8.C and 3 more crash on it), TYPE_NONCOPIED_PARTS and DECL_LANG_SPECIFIC are 0.
+   - gcc/tree.c make_node(): error recovery also reads other nodes' fields from identifiers, which on the
+     original found the identifier's name and the nodes after it: TYPE_MAIN_VARIANT was 0 (g++.pt/crash1.C),
+     DECL_LANG_SPECIFIC 1 (g++.pt/friend37.C), and both crashed. Identifiers now have room for every field,
+     all 0, which crashes the same way.
+   - gcc/integrate.c expand_inline_function(): after errors DECL_RESULT can be null; the original loaded
+     DECL_RTL from it before testing for a void function and crashed, clang moved the load to where it is
+     used. It is a volatile load now (g++.law/inline2.C at -O2).
+   - gcc/toplev.c: cc1 dies of SIGSEGV when it gets SIGBUS, which macOS raises for some bad accesses that
+     i386 Linux reports as SIGSEGV; the driver prints the number (c-torture 950922-1.c).
+12. abort () prints __FILE__ and __LINE__. So that its messages name the original's lines, a `#line N'
+   follows each change above that adds or removes lines in a file that calls abort (), and the mips.md
+   changes (copied into insn-emit.c) keep their line counts. (build.sh builds in src/obj, as the original
+   was built, so __FILE__ is ../../gcc/expr.c.)
 --- a/config.sub
 +++ b/config.sub
 @@ -264,7 +264,7 @@
@@ -178,6 +255,113 @@ xm-darwin.h to gcc/config/. What each part is for:
       enum machine_mode mode;
       struct clear_by_pieces *data;
  {
+@@ -2669,10 +2669,18 @@
+ 	      emit_insn (gen_rtx_CLOBBER (VOIDmode, x));
+ 	    }
+ 
+-	  emit_insn (GEN_FCN (mov_optab->handlers[(int) submode].insn_code)
+-		     (gen_realpart (submode, x), gen_realpart (submode, y)));
+-	  emit_insn (GEN_FCN (mov_optab->handlers[(int) submode].insn_code)
+-		     (gen_imagpart (submode, x), gen_imagpart (submode, y)));
++	  {
++	    /* Arguments right to left, as the original's build compiler
++	       (GCC 2.7.2 on i386) evaluated them: Y's part may need a new
++	       pseudo for its address before X's does.  */
++	    rtx ypart = gen_realpart (submode, y);
++	    emit_insn (GEN_FCN (mov_optab->handlers[(int) submode].insn_code)
++		       (gen_realpart (submode, x), ypart));
++	    ypart = gen_imagpart (submode, y);
++	    emit_insn (GEN_FCN (mov_optab->handlers[(int) submode].insn_code)
++		       (gen_imagpart (submode, x), ypart));
++	  }
++#line 2676
+ 	}
+ 
+       return get_last_insn ();
+@@ -7199,11 +7207,14 @@
+ 				       NULL_RTX, VOIDmode, 0);
+ 		  temp = expand_binop (mode, other_optab, op0, op1, target,
+ 				       unsignedp, OPTAB_LIB_WIDEN);
+-		  htem = expand_mult_highpart_adjust (innermode,
+-						      gen_highpart (innermode, temp),
+-						      op0, op1,
+-						      gen_highpart (innermode, temp),
+-						      unsignedp);
++		  {
++		    /* Arguments right to left, as on the original's i386 host.  */
++		    rtx high = gen_highpart (innermode, temp);
++		    htem = expand_mult_highpart_adjust (innermode,
++							gen_highpart (innermode, temp),
++							op0, op1, high, unsignedp);
++		  }
++#line 7207
+ 		  emit_move_insn (gen_highpart (innermode, temp), htem);
+ 		  return temp;
+ 		}
+@@ -8136,8 +8147,12 @@
+ 	start_sequence ();
+ 
+ 	/* Store the realpart and the negated imagpart to target.  */
+-	emit_move_insn (gen_realpart (partmode, target),
+-			gen_realpart (partmode, op0));
++	{
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  rtx real = gen_realpart (partmode, op0);
++	  emit_move_insn (gen_realpart (partmode, target), real);
++	}
++#line 8141
+ 
+ 	imag_t = gen_imagpart (partmode, target);
+ 	temp = expand_unop (partmode, neg_optab,
+@@ -9975,6 +9990,8 @@
+ expand_builtin_apply_args ()
+ {
+   rtx registers;
++  rtx tem;
++#line 9978
+   int size, align, regno;
+   enum machine_mode mode;
+ 
+@@ -10014,18 +10031,24 @@
+       }
+ 
+   /* Save the arg pointer to the block.  */
++  /* Arguments right to left (the copy is emitted first), as on the
++     original's i386 host; likewise below.  */
++  tem = copy_to_reg (virtual_incoming_args_rtx);
++#line 10017
+   emit_move_insn (change_address (registers, Pmode, XEXP (registers, 0)),
+-		  copy_to_reg (virtual_incoming_args_rtx));
++		  tem);
+   size = GET_MODE_SIZE (Pmode);
+ 
+   /* Save the structure value address unless this is passed as an
+      "invisible" first argument.  */
+   if (struct_value_incoming_rtx)
+     {
++      tem = copy_to_reg (struct_value_incoming_rtx);
++#line 10025
+       emit_move_insn (change_address (registers, Pmode,
+ 				      plus_constant (XEXP (registers, 0),
+ 						     size)),
+-		      copy_to_reg (struct_value_incoming_rtx));
++		      tem);
+       size += GET_MODE_SIZE (Pmode);
+     }
+ 
+@@ -11144,8 +11167,11 @@
+ 
+   for (i = 0; i < nwords; i++)
+     {
++      /* Arguments right to left, as on the original's i386 host.  */
++      rtx word1 = operand_subword_force (op1, i, mode);
++#line 11147
+       rtx comp = compare_from_rtx (operand_subword_force (op0, i, mode),
+-				   operand_subword_force (op1, i, mode),
++				   word1,
+ 				   EQ, TREE_UNSIGNED (TREE_TYPE (exp)),
+ 				   word_mode, NULL_RTX, 0);
+       if (comp == const_true_rtx)
 --- a/gcc/real.c
 +++ b/gcc/real.c
 @@ -478,14 +478,14 @@
@@ -253,27 +437,73 @@ xm-darwin.h to gcc/config/. What each part is for:
  	default:
 --- a/gcc/config/mips/mips.c
 +++ b/gcc/config/mips/mips.c
-@@ -5691,7 +5691,8 @@
+@@ -3271,11 +3271,15 @@
+     move_by_pieces (orig_dest, orig_src, bytes, align);
+ 	
+   else if (constp && bytes <= 2 * MAX_MOVE_BYTES)
+-    emit_insn (gen_movstrsi_internal (change_address (orig_dest, BLKmode,
+-						      dest_reg),
+-				      change_address (orig_src, BLKmode,
+-						      src_reg),
+-				      bytes_rtx, align_rtx));
++    {
++      /* Arguments right to left, as on the original's i386 host: the
++	 source's address may need a pseudo before the destination's.  */
++      rtx src = change_address (orig_src, BLKmode, src_reg);
++      emit_insn (gen_movstrsi_internal (change_address (orig_dest, BLKmode,
++							dest_reg),
++					src, bytes_rtx, align_rtx));
++    }
++#line 3279
+ 
+   else if (constp && align >= UNITS_PER_WORD && optimize)
+     block_move_loop (dest_reg, src_reg, bytes, align, orig_dest, orig_src);
+@@ -3321,12 +3325,16 @@
+ 
+       /* Bytes at the end of the loop.  */
+       if (leftover)
+-	emit_insn (gen_movstrsi_internal (change_address (orig_dest, BLKmode,
+-							  dest_reg),
+-					  change_address (orig_src, BLKmode,
+-							  src_reg),
+-					  GEN_INT (leftover),
+-					  GEN_INT (align)));
++	{
++	  /* Likewise.  */
++	  rtx align_rtx2 = GEN_INT (align);
++	  rtx leftover_rtx = GEN_INT (leftover);
++	  rtx src = change_address (orig_src, BLKmode, src_reg);
++	  emit_insn (gen_movstrsi_internal (change_address (orig_dest, BLKmode,
++							    dest_reg),
++					    src, leftover_rtx, align_rtx2));
++	}
++#line 3330
+     }
+ 
+   else
+@@ -5691,7 +5699,9 @@
    REAL_VALUE_TO_TARGET_DOUBLE (value, value_long);
  
    fprintf (stream, "\t.word\t0x%08lx\t\t# %.20g\n\t.word\t0x%08lx\n",
 -	   value_long[0], value, value_long[1]);
 +	   (long) (unsigned int) value_long[0], value,
 +	   (long) (unsigned int) value_long[1]);  /* LONG32 */
++#line 5695
  #else
    fprintf (stream, "\t.double\t%.20g\n", value);
  #endif
-@@ -5709,7 +5710,8 @@
+@@ -5709,7 +5719,9 @@
    long value_long;
    REAL_VALUE_TO_TARGET_SINGLE (value, value_long);
  
 -  fprintf (stream, "\t.word\t0x%08lx\t\t# %.12g (float)\n", value_long, value);
 +  fprintf (stream, "\t.word\t0x%08lx\t\t# %.12g (float)\n",
 +	   (long) (unsigned int) value_long, value);  /* LONG32 */
++#line 5713
  #else
    fprintf (stream, "\t.float\t%.12g\n", value);
  #endif
-@@ -6154,7 +6156,7 @@
+@@ -6154,7 +6166,7 @@
  	  else
  	    {
  	      fprintf (file, "\tli\t%s,0x%.08lx\t# ",
@@ -282,7 +512,7 @@ xm-darwin.h to gcc/config/. What each part is for:
  	      fprintf (file, HOST_WIDE_INT_PRINT_DEC, base_offset);
  	      fprintf (file, "\n\t%s\t%s,%s,%s\n",
  		       Pmode == DImode ? "daddu" : "addu",
-@@ -6377,7 +6379,7 @@
+@@ -6377,7 +6389,7 @@
  	  else
  	    {
  	      fprintf (file, "\tli\t%s,0x%.08lx\t# ",
@@ -304,7 +534,31 @@ xm-darwin.h to gcc/config/. What each part is for:
  	     to make sure that `int' was type number 1.  */
 --- a/gcc/haifa-sched.c
 +++ b/gcc/haifa-sched.c
-@@ -7080,7 +7080,7 @@
+@@ -5676,7 +5676,11 @@
+   char *s;
+ 
+   /* compute length of one field in line */
+-  s = (char *) alloca (INSN_LEN + 5);
++  /* "  %33s" writes 36 bytes, one more than INSN_LEN + 5.  The original's
++     alloca rounded the block up to 36 (its disassembly: addl $-0x24,%esp),
++     so it fit; here the fortified sprintf knows the size and aborts (-da).  */
++  s = (char *) alloca (INSN_LEN + 6);
++#line 5680
+   sprintf (s, "  %33s", "uname");
+   n1 = strlen (s);
+ 
+@@ -6096,7 +6100,9 @@
+       cur = safe_concat (buf, cur, t);
+       break;
+     case CONST_DOUBLE:
+-      sprintf (t, "<0x%lx,0x%lx>", (long)XWINT (x, 2), (long)XWINT (x, 3));
++      sprintf (t, "<0x%lx,0x%lx>", (long) (unsigned int) XWINT (x, 2),
++	       (long) (unsigned int) XWINT (x, 3));  /* LONG32 */
++#line 6100
+       cur = safe_concat (buf, cur, t);
+       break;
+     case CONST_STRING:
+@@ -7080,7 +7086,7 @@
    bzero ((char *) bb_pending_read_mems, n_bbs * sizeof (rtx));
    bzero ((char *) bb_pending_write_insns, n_bbs * sizeof (rtx));
    bzero ((char *) bb_pending_write_mems, n_bbs * sizeof (rtx));
@@ -315,7 +569,7 @@ xm-darwin.h to gcc/config/. What each part is for:
    bzero ((char *) bb_sched_before_next_call, n_bbs * sizeof (rtx));
 --- a/gcc/jump.c
 +++ b/gcc/jump.c
-@@ -2261,6 +2261,7 @@
+@@ -2261,9 +2261,11 @@
  	 gcse.  We eliminate such insns now to avoid having them
  	 cause problems later.  */
        else if (GET_CODE (insn) == JUMP_INSN
@@ -323,9 +577,13 @@ xm-darwin.h to gcc/config/. What each part is for:
  	       && SET_SRC (PATTERN (insn)) == pc_rtx
  	       && SET_DEST (PATTERN (insn)) == pc_rtx)
  	insn = delete_insn (insn);
++#line 2267
+       else
+ 	insn = NEXT_INSN (insn);
+     }
 --- a/gcc/loop.c
 +++ b/gcc/loop.c
-@@ -2628,7 +2628,15 @@
+@@ -2628,7 +2628,16 @@
  	    break;
  
  	  case NOTE_INSN_LOOP_CONT:
@@ -339,6 +597,1074 @@ xm-darwin.h to gcc/config/. What each part is for:
 +		 loop_number_cont_dominator, allocated just below.  Do that
 +		 here too instead of writing outside the block.  */
 +	      loop_number_cont_dominator[max_loop_num - 1] = insn;
++#line 2632
  	    break;
  	  case NOTE_INSN_LOOP_END:
  	    if (current_loop == -1)
+--- a/gcc/cp/cp-tree.h
++++ b/gcc/cp/cp-tree.h
+@@ -838,7 +838,13 @@
+ #define TYPE_REDEFINED(NODE) (TYPE_LANG_SPECIFIC(NODE)->type_flags.redefined)
+ 
+ /* Nonzero means that this type is a signature.  */
+-# define IS_SIGNATURE(NODE) (TYPE_LANG_SPECIFIC(NODE)?TYPE_LANG_SPECIFIC(NODE)->type_flags.is_signature:0)
++/* Only class types have a struct lang_type.  A pointer to member function
++   type keeps its __ptrmemfunc_type RECORD_TYPE in TYPE_LANG_SPECIFIC (see
++   TYPE_SET_PTRMEMFUNC_TYPE), and reading is_signature from that tree read
++   host-dependent bits: on the original's i386 host the low byte of its
++   TREE_TYPE, which is null, so 0; on a 64-bit host part of its TREE_CHAIN
++   address, which made `(int (A::*)()) 0' a "signature type" on x86_64.  */
++# define IS_SIGNATURE(NODE) (IS_AGGR_TYPE_CODE (TREE_CODE (NODE)) && TYPE_LANG_SPECIFIC(NODE)?TYPE_LANG_SPECIFIC(NODE)->type_flags.is_signature:0)
+ # define SET_SIGNATURE(NODE) (TYPE_LANG_SPECIFIC(NODE)->type_flags.is_signature=1)
+ # define CLEAR_SIGNATURE(NODE) (TYPE_LANG_SPECIFIC(NODE)->type_flags.is_signature=0)
+ 
+@@ -2925,14 +2931,16 @@
+ extern tree lookup_arg_dependent                PROTO((tree, tree, tree));
+ 
+ /* in errfn.c */
+-extern void cp_error				();
+-extern void cp_error_at				();
+-extern void cp_warning				();
+-extern void cp_warning_at			();
+-extern void cp_pedwarn				();
+-extern void cp_pedwarn_at			();
+-extern void cp_compiler_error			();
+-extern void cp_sprintf				();
++/* These are variadic: with no prototype, Apple arm64 passes the arguments in
++   registers while the callee reads them from the stack.  */
++extern void cp_error				PVPROTO((const char *, ...));
++extern void cp_error_at				PVPROTO((const char *, ...));
++extern void cp_warning				PVPROTO((const char *, ...));
++extern void cp_warning_at			PVPROTO((const char *, ...));
++extern void cp_pedwarn				PVPROTO((const char *, ...));
++extern void cp_pedwarn_at			PVPROTO((const char *, ...));
++extern void cp_compiler_error			PVPROTO((const char *, ...));
++extern void cp_sprintf				PVPROTO((const char *, ...));
+ 
+ /* in error.c */
+ extern void init_error				PROTO((void));
+--- a/gcc/cp/errfn.c
++++ b/gcc/cp/errfn.c
+@@ -39,6 +39,9 @@
+ 
+ typedef void errorfn ();	/* deliberately vague */
+ 
++extern errorfn compiler_error;
++#line 41
++
+ extern char* cp_file_of PROTO((tree));
+ extern int   cp_line_of PROTO((tree));
+ 
+@@ -178,14 +181,21 @@
+   if (nargs == 0 && atarg1)
+     atarg = va_arg (ap, tree);
+ 
++  /* ERRFN is variadic (error, warning, pedwarn and their _with_file_and_line
++     forms), except compiler_error, which is K&R.  Call each the way it is
++     defined: Apple arm64 passes variadic arguments on the stack.  */
++#line 181
+   if (atarg)
+     {
+       char *file = cp_file_of (atarg);
+       int   line = cp_line_of (atarg);
+-      (*errfn) (file, line, "%s", buf);
++      (*(void (*) PVPROTO((char *, int, char *, ...))) errfn) (file, line, "%s", buf);
+     }
+-  else
++  else if (errfn == compiler_error)
+     (*errfn) ("%s", buf);
++#line 187
++  else
++    (*(void (*) PVPROTO((char *, ...))) errfn) ("%s", buf);
+ 
+ }
+ 
+@@ -245,9 +255,8 @@
+     cp_thing ((errorfn *) pedwarn, 0, format, ap);
+   va_end (ap);
+ }
++#line 250
+ 
+-extern errorfn compiler_error;
+-
+ void
+ cp_compiler_error VPROTO((const char *format, ...))
+ {
+--- a/gcc/cp/typeck2.c
++++ b/gcc/cp/typeck2.c
+@@ -84,7 +84,7 @@
+      int soft;
+ {
+   char *fmt;
+-  void (*fn)();
++  void (*fn) PVPROTO((const char *, ...));  /* cp_pedwarn and cp_error are variadic */
+ 
+   if (soft)
+     fn = cp_pedwarn;
+@@ -1535,7 +1535,7 @@
+ 
+       /* Value must have been cast.  */
+       sprintf (buf, "(enum %s)%ld",
+-	       TYPE_NAME_STRING (type), (long) intval);
++	       TYPE_NAME_STRING (type), (long) (int) intval);  /* LONG32 */
+       return buf;
+     }
+   return IDENTIFIER_POINTER (TREE_PURPOSE (values));
+--- a/gcc/cp/decl.c
++++ b/gcc/cp/decl.c
+@@ -5921,6 +5921,22 @@
+ 
+   /* Must lay these out before anything else gets laid out.  */
+   error_mark_node = make_node (ERROR_MARK);
++  /* Error recovery reads fields that an ERROR_MARK node does not have. On the original's i386 host the
++     12-byte node was followed by error_mark_list and this_identifier, so those reads found their fields.
++     Here error_mark_node gets room for every field, holding what the original found in the fields that
++     g++ tests read: TREE_OPERAND (error_mark_node, 0) was TREE_TYPE (error_mark_list); DECL_CONTEXT was
++     IDENTIFIER_LENGTH (this_identifier), 4, so a class head after a bad template-id crashes there
++     (g++.brendan/crash8.C); TYPE_NONCOPIED_PARTS (g++.jason/dtor3.C) and DECL_LANG_SPECIFIC
++     (g++.pt/ttp19.C) were 0, as are the rest here. The obstack keeps the small node, so later nodes
++     are laid out as before.  */
++  {
++    static union tree_node i386_error_mark_node;
++    bcopy ((char *) error_mark_node, (char *) &i386_error_mark_node, sizeof (struct tree_common));
++    error_mark_node = &i386_error_mark_node;
++    TREE_OPERAND (error_mark_node, 0) = error_mark_node;
++    DECL_CONTEXT (error_mark_node) = (tree) 4;
++  }
++#line 5924
+   TREE_PERMANENT (error_mark_node) = 1;
+   TREE_TYPE (error_mark_node) = error_mark_node;
+   error_mark_list = build_tree_list (error_mark_node, error_mark_node);
+@@ -8977,6 +8993,8 @@
+   {
+     tree *next = &declarator;
+     register tree decl;
++    tree dtor_name;	/* see BIT_NOT_EXPR below */
++#line 8980
+     name = NULL;
+ 
+     while (next && *next)
+@@ -9032,7 +9050,12 @@
+ 			    name, rename);
+ 		  TREE_OPERAND (decl, 0) = rename;
+ 		}
+-	      next = &name;
++	      /* This was `next = &name', and the loop then read NAME after its
++		 block had ended: the original's stack slot still held it, but
++		 clang reuses or drops it.  Keep the value where it lasts.  */
++	      dtor_name = name;
++	      next = &dtor_name;
++#line 9036
+ 	    }
+ 	    break;
+ 
+--- a/gcc/cp/call.c
++++ b/gcc/cp/call.c
+@@ -1133,7 +1133,11 @@
+ {
+   tree parmlist = TYPE_ARG_TYPES (TREE_TYPE (fn));
+   int i, len;
+-  tree convs;
++  /* Was uninitialised: a candidate found not viable below is added with
++     whatever CONVS held, and nothing reads it.  But clang treats passing an
++     uninitialised value as undefined and deleted that path, which made such
++     candidates viable (`foo f;' became ambiguous with the copy ctor).  */
++  tree convs = NULL_TREE;
+   tree parmnode, argnode;
+   int viable = 1;
+ 
+--- a/gcc/cp/rtti.c
++++ b/gcc/cp/rtti.c
+@@ -252,7 +252,10 @@
+ {
+   tree cond = NULL_TREE;
+   tree type = TREE_TYPE (tinfo_fn_type);
+-  int nonnull;
++  /* Was uninitialised, and resolves_to_fixed_type_p only ever sets it to 1.
++     In the original it held whatever was on the stack, never 0 in any test
++     (so `typeid (*p)' got no null check); with 0 a check would be added.  */
++  int nonnull = 1;
+ 
+   if (TYPE_SIZE (type_info_type_node) == NULL_TREE)
+     {
+--- a/gcc/cp/decl2.c
++++ b/gcc/cp/decl2.c
+@@ -3644,9 +3644,17 @@
+ 	return do_identifier (TREE_OPERAND (t, 0), 0, NULL_TREE);
+ 
+     case TEMPLATE_ID_EXPR:
+-      return (lookup_template_function
+-	      (build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	       build_expr_from_tree (TREE_OPERAND (t, 1))));
++      {
++	/* The order of evaluation of a call's arguments is unspecified, and
++	   here it decides which templates get instantiated first, and so the
++	   order in which functions are output.  The original cc1plus was built
++	   with GCC 2.7.2 on i386, which evaluates arguments right to left;
++	   clang goes left to right.  So the later arguments are computed
++	   first, explicitly, here and below.  */
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return (lookup_template_function
++		(build_expr_from_tree (TREE_OPERAND (t, 0)), op1));
++      }
+ 
+     case INDIRECT_REF:
+       return build_x_indirect_ref
+@@ -3718,15 +3726,21 @@
+     case LT_EXPR:
+     case GT_EXPR:
+     case MEMBER_REF:
+-      return build_x_binary_op
+-	(TREE_CODE (t), 
+-	 build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 1)));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return build_x_binary_op
++	  (TREE_CODE (t), 
++	   build_expr_from_tree (TREE_OPERAND (t, 0)), op1);
++      }
+ 
+     case DOTSTAR_EXPR:
+-      return build_m_component_ref
+-	(build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 1)));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return build_m_component_ref
++	  (build_expr_from_tree (TREE_OPERAND (t, 0)), op1);
++      }
+ 
+     case SCOPE_REF:
+       return build_offset_ref (TREE_OPERAND (t, 0), TREE_OPERAND (t, 1));
+@@ -3736,8 +3750,12 @@
+ 	/* new-type-id */
+ 	return build_parse_node (ARRAY_REF, NULL_TREE,
+ 				 build_expr_from_tree (TREE_OPERAND (t, 1)));
+-      return grok_array_decl (build_expr_from_tree (TREE_OPERAND (t, 0)),
+-			      build_expr_from_tree (TREE_OPERAND (t, 1)));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return grok_array_decl (build_expr_from_tree (TREE_OPERAND (t, 0)),
++				op1);
++      }
+ 
+     case SIZEOF_EXPR:
+     case ALIGNOF_EXPR:
+@@ -3749,27 +3767,36 @@
+       }
+ 
+     case MODOP_EXPR:
+-      return build_x_modify_expr
+-	(build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 TREE_CODE (TREE_OPERAND (t, 1)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 2)));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = build_expr_from_tree (TREE_OPERAND (t, 2));
++	return build_x_modify_expr
++	  (build_expr_from_tree (TREE_OPERAND (t, 0)),
++	   TREE_CODE (TREE_OPERAND (t, 1)), op2);
++      }
+ 
+     case ARROW_EXPR:
+       return build_x_arrow
+ 	(build_expr_from_tree (TREE_OPERAND (t, 0)));
+ 
+     case NEW_EXPR:
+-      return build_new
+-	(build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 1)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 2)),
+-	 NEW_EXPR_USE_GLOBAL (t));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = build_expr_from_tree (TREE_OPERAND (t, 2));
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return build_new
++	  (build_expr_from_tree (TREE_OPERAND (t, 0)), op1, op2,
++	   NEW_EXPR_USE_GLOBAL (t));
++      }
+ 
+     case DELETE_EXPR:
+-      return delete_sanity
+-	(build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 1)),
+-	 DELETE_EXPR_USE_VEC (t), DELETE_EXPR_USE_GLOBAL (t));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return delete_sanity
++	  (build_expr_from_tree (TREE_OPERAND (t, 0)), op1,
++	   DELETE_EXPR_USE_VEC (t), DELETE_EXPR_USE_GLOBAL (t));
++      }
+ 
+     case COMPOUND_EXPR:
+       if (TREE_OPERAND (t, 1) == NULL_TREE)
+@@ -3782,11 +3809,12 @@
+       if (TREE_CODE (TREE_OPERAND (t, 0)) == SCOPE_REF)
+ 	{
+ 	  tree ref = TREE_OPERAND (t, 0);
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  tree op2 = build_expr_from_tree (TREE_OPERAND (t, 2));
++	  tree ref0 = build_expr_from_tree (TREE_OPERAND (ref, 0));
+ 	  return build_scoped_method_call
+-	    (build_expr_from_tree (TREE_OPERAND (t, 1)),
+-	     build_expr_from_tree (TREE_OPERAND (ref, 0)),
+-	     TREE_OPERAND (ref, 1),
+-	     build_expr_from_tree (TREE_OPERAND (t, 2)));
++	    (build_expr_from_tree (TREE_OPERAND (t, 1)), ref0,
++	     TREE_OPERAND (ref, 1), op2);
+ 	}
+       else 
+ 	{
+@@ -3801,24 +3829,26 @@
+ 	     and things like that are not correctly resolved by
+ 	     build_expr_from_tree.  So, just use build_expr_from_tree
+ 	     when we really need it.  */
++	  tree op2;
+ 	  if (TREE_CODE (fn) == TEMPLATE_ID_EXPR)
+ 	    fn = build_expr_from_tree (fn);
+ 
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  op2 = build_expr_from_tree (TREE_OPERAND (t, 2));
+ 	  return build_method_call
+ 	    (build_expr_from_tree (TREE_OPERAND (t, 1)),
+-	     fn,
+-	     build_expr_from_tree (TREE_OPERAND (t, 2)),
+-	     NULL_TREE, LOOKUP_NORMAL);
++	     fn, op2, NULL_TREE, LOOKUP_NORMAL);
+ 	}
+ 
+     case CALL_EXPR:
+       if (TREE_CODE (TREE_OPERAND (t, 0)) == SCOPE_REF)
+ 	{
+ 	  tree ref = TREE_OPERAND (t, 0);
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
+ 	  return build_member_call
+ 	    (build_expr_from_tree (TREE_OPERAND (ref, 0)),
+-	     TREE_OPERAND (ref, 1),
+-	     build_expr_from_tree (TREE_OPERAND (t, 1)));
++	     TREE_OPERAND (ref, 1), op1);
+ 	}
+       else
+ 	{
+@@ -3841,10 +3871,13 @@
+ 	}
+ 
+     case COND_EXPR:
+-      return build_x_conditional_expr
+-	(build_expr_from_tree (TREE_OPERAND (t, 0)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 1)),
+-	 build_expr_from_tree (TREE_OPERAND (t, 2)));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = build_expr_from_tree (TREE_OPERAND (t, 2));
++	tree op1 = build_expr_from_tree (TREE_OPERAND (t, 1));
++	return build_x_conditional_expr
++	  (build_expr_from_tree (TREE_OPERAND (t, 0)), op1, op2);
++      }
+ 
+     case TREE_LIST:
+       {
+--- a/gcc/cp/pt.c
++++ b/gcc/cp/pt.c
+@@ -4340,14 +4340,20 @@
+       tree template_id;
+       tree new_args;
+       tree tmpl;
++      /* The order of evaluation of a call's arguments is unspecified, and
++	 in this file it decides which templates get instantiated first,
++	 and so the order in which functions are output.  The original
++	 cc1plus was built with GCC 2.7.2 on i386, which evaluates arguments
++	 right to left; clang goes left to right.  So the later arguments
++	 are computed first, explicitly, here and below.  */
++      tree targs = tsubst (DECL_TI_ARGS (decl), args, /*complain=*/1,
++			   NULL_TREE);
+ 
+       template_id
+ 	= lookup_template_function (tsubst_expr (DECL_TI_TEMPLATE (decl),
+ 						 args, /*complain=*/1, 
+ 						 NULL_TREE),
+-				    tsubst (DECL_TI_ARGS (decl),
+-					    args, /*complain=*/1, 
+-					    NULL_TREE));
++				    targs);
+       /* FIXME: The decl we create via the next tsubst could be
+ 	 created on a temporary obstack.  */
+       new_friend = tsubst (decl, args, /*complain=*/1, NULL_TREE);
+@@ -5171,11 +5177,12 @@
+ 	  tree parm_decl = 
+ 	    TREE_VALUE (TREE_VEC_ELT (TREE_VALUE (parms), i));
+ 	  
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  tree new_parm = tsubst (parm_decl, args, complain, NULL_TREE);
++
+ 	  TREE_VEC_ELT (new_vec, i)
+ 	    = build_tree_list (tsubst (default_value, args, complain,
+-				       NULL_TREE), 
+-			       tsubst (parm_decl, args, complain,
+-				       NULL_TREE));
++				       NULL_TREE), new_parm);
+ 	}
+       
+       *new_parms = 
+@@ -6640,9 +6647,12 @@
+     case STATIC_CAST_EXPR:
+     case DYNAMIC_CAST_EXPR:
+     case NOP_EXPR:
+-      return build1
+-	(code, tsubst (TREE_TYPE (t), args, complain, in_decl),
+-	 tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op0 = tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl);
++	return build1
++	  (code, tsubst (TREE_TYPE (t), args, complain, in_decl), op0);
++      }
+ 
+     case INDIRECT_REF:
+     case PREDECREMENT_EXPR:
+@@ -6699,9 +6709,13 @@
+     case SCOPE_REF:
+     case DOTSTAR_EXPR:
+     case MEMBER_REF:
+-      return build_nt
+-	(code, tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl),
+-	 tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl);
++	return build_nt
++	  (code, tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl),
++	   op1);
++      }
+ 
+     case CALL_EXPR:
+       {
+@@ -6720,6 +6734,7 @@
+     case METHOD_CALL_EXPR:
+       {
+ 	tree name = TREE_OPERAND (t, 0);
++	tree op2;
+ 	if (TREE_CODE (name) == BIT_NOT_EXPR)
+ 	  {
+ 	    name = tsubst_copy (TREE_OPERAND (name, 0), args,
+@@ -6739,21 +6754,24 @@
+ 	  }
+ 	else
+ 	  name = tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl);
++	/* Arguments right to left, as on the original's i386 host.  */
++	op2 = tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl);
+ 	return build_nt
+ 	  (code, name, tsubst_copy (TREE_OPERAND (t, 1), args,
+ 				    complain, in_decl),
+-	   tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl),
+-	   NULL_TREE);
++	   op2, NULL_TREE);
+       }
+ 
+     case BIND_EXPR:
+     case COND_EXPR:
+     case MODOP_EXPR:
+       {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl);
++	tree op1 = tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl);
+ 	r = build_nt
+ 	  (code, tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl),
+-	   tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl),
+-	   tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl));
++	   op1, op2);
+ 
+ 	if (code == BIND_EXPR && !processing_template_decl)
+ 	  {
+@@ -6774,19 +6792,23 @@
+ 
+     case NEW_EXPR:
+       {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl);
++	tree op1 = tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl);
+ 	r = build_nt
+ 	(code, tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl),
+-	 tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl),
+-	 tsubst_copy (TREE_OPERAND (t, 2), args, complain, in_decl));
++	 op1, op2);
+ 	NEW_EXPR_USE_GLOBAL (r) = NEW_EXPR_USE_GLOBAL (t);
+ 	return r;
+       }
+ 
+     case DELETE_EXPR:
+       {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op1 = tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl);
+ 	r = build_nt
+ 	(code, tsubst_copy (TREE_OPERAND (t, 0), args, complain, in_decl),
+-	 tsubst_copy (TREE_OPERAND (t, 1), args, complain, in_decl));
++	 op1);
+ 	DELETE_EXPR_USE_GLOBAL (r) = DELETE_EXPR_USE_GLOBAL (t);
+ 	DELETE_EXPR_USE_VEC (r) = DELETE_EXPR_USE_VEC (t);
+ 	return r;
+@@ -6857,10 +6879,11 @@
+ 
+     case CONSTRUCTOR:
+       {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree elts = tsubst_copy (CONSTRUCTOR_ELTS (t), args, complain, in_decl);
+ 	r = build
+ 	  (CONSTRUCTOR, tsubst (TREE_TYPE (t), args, complain, in_decl), 
+-	   NULL_TREE, tsubst_copy (CONSTRUCTOR_ELTS (t), args,
+-				   complain, in_decl));
++	   NULL_TREE, elts);
+ 	TREE_HAS_CONSTRUCTOR (r) = TREE_HAS_CONSTRUCTOR (t);
+ 	return r;
+       }
+@@ -6905,9 +6928,10 @@
+ 
+ 	lineno = TREE_COMPLEXITY (t);
+ 	emit_line_note (input_filename, lineno);
++	/* Arguments right to left, as on the original's i386 host.  */
++	dcl = tsubst (TREE_OPERAND (t, 1), args, complain, in_decl);
+ 	dcl = start_decl
+-	  (tsubst (TREE_OPERAND (t, 0), args, complain, in_decl),
+-	   tsubst (TREE_OPERAND (t, 1), args, complain, in_decl),
++	  (tsubst (TREE_OPERAND (t, 0), args, complain, in_decl), dcl,
+ 	   TREE_OPERAND (t, 2) != 0, NULL_TREE, NULL_TREE);
+ 	init = tsubst_expr (TREE_OPERAND (t, 2), args, complain, in_decl);
+ 	cp_finish_decl
+@@ -7028,8 +7052,12 @@
+       break;
+ 
+     case CASE_LABEL:
+-      finish_case_label (tsubst_expr (CASE_LOW (t), args, complain, in_decl),
+-			 tsubst_expr (CASE_HIGH (t), args, complain, in_decl));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree high = tsubst_expr (CASE_HIGH (t), args, complain, in_decl);
++	finish_case_label (tsubst_expr (CASE_LOW (t), args, complain, in_decl),
++			   high);
++      }
+       break;
+ 
+     case LABEL_DECL:
+@@ -7052,12 +7080,15 @@
+ 
+     case ASM_STMT:
+       lineno = TREE_COMPLEXITY (t);
+-      finish_asm_stmt (ASM_CV_QUAL (t),
+-		       tsubst_expr (ASM_STRING (t), args, complain, in_decl),
+-		       tsubst_expr (ASM_OUTPUTS (t), args, complain, in_decl),
+-		       tsubst_expr (ASM_INPUTS (t), args, complain, in_decl), 
+-		       tsubst_expr (ASM_CLOBBERS (t), args, complain,
+-				    in_decl));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree clobbers = tsubst_expr (ASM_CLOBBERS (t), args, complain, in_decl);
++	tree inputs = tsubst_expr (ASM_INPUTS (t), args, complain, in_decl);
++	tree outputs = tsubst_expr (ASM_OUTPUTS (t), args, complain, in_decl);
++	finish_asm_stmt (ASM_CV_QUAL (t),
++			 tsubst_expr (ASM_STRING (t), args, complain, in_decl),
++			 outputs, inputs, clobbers);
++      }
+       break;
+ 
+     case TRY_BLOCK:
+@@ -7079,9 +7110,12 @@
+       if (HANDLER_PARMS (t))
+ 	{
+ 	  tree d = HANDLER_PARMS (t);
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  tree declarator = tsubst (TREE_OPERAND (d, 0), args, complain,
++				    in_decl);
+ 	  expand_start_catch_block
+ 	    (tsubst (TREE_OPERAND (d, 1), args, complain, in_decl),
+-	     tsubst (TREE_OPERAND (d, 0), args, complain, in_decl));
++	     declarator);
+ 	}
+       else
+ 	expand_start_catch_block (NULL_TREE, NULL_TREE);
+--- a/gcc/cp/typeck.c
++++ b/gcc/cp/typeck.c
+@@ -1955,21 +1955,30 @@
+   /* For MIN_EXPR or MAX_EXPR, fold-const.c has arranged things so that
+      the first operand is always the one to be used if both operands
+      are equal, so we know what conditional expression this used to be.  */
++  /* The order of evaluation of a call's arguments is unspecified, and it
++     decides the order of diagnostics and of template instantiations.  The
++     original cc1plus was built with GCC 2.7.2 on i386, which evaluates
++     arguments right to left; clang goes left to right.  So the later
++     arguments are computed first, explicitly, here and below.  */
+   if (TREE_CODE (t) == MIN_EXPR || TREE_CODE (t) == MAX_EXPR)
+     {
++      tree op1 = build_unary_op (code, TREE_OPERAND (t, 1), 0);
++      tree op0 = build_unary_op (code, TREE_OPERAND (t, 0), 0);
+       return
+ 	build_conditional_expr (build_x_binary_op ((TREE_CODE (t) == MIN_EXPR
+ 						    ? LE_EXPR : GE_EXPR),
+ 						   TREE_OPERAND (t, 0),
+ 						   TREE_OPERAND (t, 1)),
+-			    build_unary_op (code, TREE_OPERAND (t, 0), 0),
+-			    build_unary_op (code, TREE_OPERAND (t, 1), 0));
++			    op0, op1);
+     }
+ 
+-  return
+-    build_conditional_expr (TREE_OPERAND (t, 0),
+-			    build_unary_op (code, TREE_OPERAND (t, 1), 0),
+-			    build_unary_op (code, TREE_OPERAND (t, 2), 0));
++  {
++    tree op2 = build_unary_op (code, TREE_OPERAND (t, 2), 0);
++    return
++      build_conditional_expr (TREE_OPERAND (t, 0),
++			      build_unary_op (code, TREE_OPERAND (t, 1), 0),
++			      op2);
++  }
+ }
+ 
+ /* Given the TYPE of an anonymous union field inside T, return the
+@@ -2047,12 +2056,16 @@
+ 		      TREE_OPERAND (datum, 0), value);
+       }
+     case COND_EXPR:
+-      return build_conditional_expr
+-	(TREE_OPERAND (datum, 0),
+-	 build_component_ref (TREE_OPERAND (datum, 1), component,
+-			      basetype_path, protect),
+-	 build_component_ref (TREE_OPERAND (datum, 2), component,
+-			      basetype_path, protect));
++      {
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = build_component_ref (TREE_OPERAND (datum, 2), component,
++					basetype_path, protect);
++	return build_conditional_expr
++	  (TREE_OPERAND (datum, 0),
++	   build_component_ref (TREE_OPERAND (datum, 1), component,
++				basetype_path, protect),
++	   op2);
++      }
+ 
+     case TEMPLATE_DECL:
+       cp_error ("invalid use of %D", datum);
+@@ -3995,7 +4008,7 @@
+ 
+ 		  bits = TYPE_PRECISION (TREE_TYPE (primop));
+ 		  if (bits < TYPE_PRECISION (result_type)
+-		      && bits < HOST_BITS_PER_LONG && unsignedp)
++		      && bits < 32 && unsignedp)  /* LONG32: was HOST_BITS_PER_LONG */
+ 		    {
+ 		      mask = (~ (HOST_WIDE_INT) 0) << bits;
+ 		      if ((mask & constant) != mask)
+@@ -5887,12 +5900,14 @@
+ 	/* Produce (a ? (b = rhs) : (c = rhs))
+ 	   except that the RHS goes through a save-expr
+ 	   so the code to compute it is only emitted once.  */
++	/* Arguments right to left, as on the original's i386 host.  */
++	tree op2 = build_modify_expr (cp_convert (TREE_TYPE (lhs), TREE_OPERAND (lhs, 2)),
++				      modifycode, rhs);
+ 	tree cond
+ 	  = build_conditional_expr (TREE_OPERAND (lhs, 0),
+ 				    build_modify_expr (cp_convert (TREE_TYPE (lhs), TREE_OPERAND (lhs, 1)),
+ 						       modifycode, rhs),
+-				    build_modify_expr (cp_convert (TREE_TYPE (lhs), TREE_OPERAND (lhs, 2)),
+-						       modifycode, rhs));
++				    op2);
+ 	if (cond == error_mark_node)
+ 	  return cond;
+ 	/* Make sure the code to compute the rhs comes out
+@@ -6229,6 +6244,10 @@
+       else
+ 	{
+ 	  tree result_type = TREE_TYPE (newrhs);
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  tree op2 = build_modify_expr (lhs1, modifycode,
++					cp_convert (result_type,
++						    TREE_OPERAND (newrhs, 2)));
+ 	  /* We have to convert each arm to the proper type because the
+ 	     types may have been munged by constant folding.  */
+ 	  result
+@@ -6236,9 +6255,7 @@
+ 		     build_modify_expr (lhs, modifycode,
+ 					cp_convert (result_type,
+ 						    TREE_OPERAND (newrhs, 1))),
+-		     build_modify_expr (lhs1, modifycode,
+-					cp_convert (result_type,
+-						    TREE_OPERAND (newrhs, 2))));
++		     op2);
+ 	}
+     }
+   else
+--- a/gcc/cp/error.c
++++ b/gcc/cp/error.c
+@@ -1321,8 +1321,11 @@
+ 	      static char format[10]; /* "%x%09999x\0" */
+ 	      if (!format[0])
+ 		sprintf (format, "%%x%%0%dx", HOST_BITS_PER_INT / 4);
+-	      sprintf (digit_buffer, format, TREE_INT_CST_HIGH (val),
+-		       TREE_INT_CST_LOW (val));
++	      /* LONG32: FORMAT is "%x%08x" and both words are 64-bit, so the
++		 original's i386 printf printed the two halves of the high word
++		 and never the low one.  */
++	      sprintf (digit_buffer, format, (int) TREE_INT_CST_HIGH (val),
++		       (int) (TREE_INT_CST_HIGH (val) >> 32));
+ 	      OB_PUTCP (digit_buffer);
+ 	    }
+ 	  }
+--- a/gcc/c-typeck.c
++++ b/gcc/c-typeck.c
+@@ -2595,7 +2595,7 @@
+ 
+ 		      bits = TYPE_PRECISION (TREE_TYPE (primop));
+ 		      if (bits < TYPE_PRECISION (result_type)
+-			  && bits < HOST_BITS_PER_LONG && unsignedp)
++			  && bits < 32 && unsignedp)  /* LONG32: was HOST_BITS_PER_LONG */
+ 			{
+ 			  mask = (~0L) << bits;
+ 			  if ((mask & constant) != mask)
+--- a/gcc/except.c
++++ b/gcc/except.c
+@@ -392,6 +392,8 @@
+ #include "defaults.h"
+ #include "eh-common.h"
+ #include "system.h"
++#include <signal.h>
++#line 395
+ #include "rtl.h"
+ #include "tree.h"
+ #include "flags.h"
+@@ -836,8 +838,16 @@
+       last = NULL;
+       handler = function_eh_regions[x].handlers;
+       for ( ; handler; last = handler, handler = handler->next)
+-        if (handler->handler_label == removing_label)
++	/* This compared HANDLER_LABEL with REMOVING_LABEL.  But the regions
++	   of functions already compiled still point to their labels, whose
++	   memory has been freed and reused, so a new label at the same address
++	   removed an unrelated handler (and its exception table entry).  Where
++	   that happens depends on the host's object sizes; it happened
++	   elsewhere on the original's 32-bit host.  Label numbers are unique
++	   in the file.  */
++        if (handler->handler_number == CODE_LABEL_NUMBER (removing_label))
+           {
++#line 841
+             if (last)
+               {
+                 last->next = handler->next;
+@@ -951,7 +961,20 @@
+ get_first_handler (region)
+      int region;
+ {
+-  return function_eh_regions[find_func_region (region)].handlers;
++  int r = find_func_region (region);
++
++  /* A region that isn't found made this read function_eh_regions[-1]: on
++     the original's i386 host that is the malloc chunk header, a small odd
++     number, so following it crashed the compiler with SIGSEGV.  Do exactly
++     that instead of reading whatever lies before the block here, so that
++     cc1plus's handler (or, for cc1, the driver) reports it as before.  */
++  if (r == -1)
++    {
++      raise (SIGSEGV);
++      abort ();
++    }
++  return function_eh_regions[r].handlers;
++#line 955
+ }
+ 
+ /* Clean out the function_eh_region table and free all memory */
+--- a/gcc/sibcall.c
++++ b/gcc/sibcall.c
+@@ -343,7 +343,13 @@
+ 
+   /* We need cfg information to determine which blocks are succeeded
+      only by the epilogue.  */
+-  find_basic_blocks (insns, max_reg_num (), 0);
++  /* This passed no DO_CLEANUP (find_basic_blocks is undeclared here), so
++     find_basic_blocks read whatever was in the argument's place.  On the
++     original that was INSNS, the argument of jump_optimize_minimal above,
++     still on the stack because GCC defers popping it (its disassembly:
++     push %ebx; call jump_optimize_minimal; push $0; ...; addl $0x10,%esp).
++     So it was never 0, and unreachable blocks were always deleted.  */
++  find_basic_blocks (insns, max_reg_num (), 0, 1);
+ 
+   /* If there are no basic blocks, then there is nothing to do.  */
+   if (n_basic_blocks == 0)
+--- a/gcc/tree.c
++++ b/gcc/tree.c
+@@ -1076,6 +1076,15 @@
+       /* Identifier nodes are always permanent since they are
+ 	 unique in a compiler run.  */
+       if (code == IDENTIFIER_NODE) obstack = &permanent_obstack;
++      /* Error recovery reads fields of other kinds of node from identifiers:
++	 TYPE_MAIN_VARIANT (g++.pt/crash1.C), DECL_LANG_SPECIFIC
++	 (g++.pt/friend37.C). On the original's i386 host those offsets fell in
++	 the identifier's name and the nodes after it, and held 0 and 1, so both
++	 compilers crashed; the port's 64-bit offsets fell elsewhere. Give
++	 identifiers room for every field, all 0.  */
++      if (code == IDENTIFIER_NODE && length < sizeof (union tree_node))
++	length = sizeof (union tree_node);
++#line 1079
+       break;
+ 
+     default:
+@@ -4927,19 +4936,15 @@
+   static unsigned HOST_WIDE_INT value;
+   unsigned HOST_WIDE_INT v;
+ 
+-#ifdef HAVE_GETTIMEOFDAY
+-  struct timeval tv;
+-#endif
+-
++#line 4934
+   template += strlen (template);
+ 
+-#ifdef HAVE_GETTIMEOFDAY
+-  /* Get some more or less random data.  */
+-  gettimeofday (&tv, NULL);
+-  value += ((unsigned HOST_WIDE_INT) tv.tv_usec << 16) ^ tv.tv_sec ^ getpid ();
+-#else
+-  value += getpid ();
+-#endif
++  /* The original adds ((tv_usec << 16) ^ tv_sec ^ getpid ()) to VALUE here,
++     from the time of day, so these names differed between any two runs.
++     The port adds 0: what the original adds when its gettimeofday returns
++     tv_sec = pid and tv_usec = 0 (contrib/ee-gcc-native/tools/fixed-clock.c),
++     so the names are the same every time, and the same as that original's.  */
++#line 4943
+ 
+   v = value;
+ 
+--- a/gcc/config/mips/mips.md
++++ b/gcc/config/mips/mips.md
+@@ -1812,10 +1812,10 @@
+      clobber pseudos instead of scratches.  */
+   if (HAVE_mulsi3_mult3_r5900)
+     {
++      /* Right to left, as the original's build compiler evaluated them.  */
++      rtx t5 = gen_reg_rtx (SImode), t4 = gen_reg_rtx (SImode), t3 = gen_reg_rtx (SImode);
+       emit_insn (gen_mulsi3_mult3_r5900 (operands[0], operands[1], operands[2],
+-				         gen_reg_rtx (SImode),
+-				         gen_reg_rtx (SImode),
+-				         gen_reg_rtx (SImode)));
++				         t3, t4, t5));
+       DONE;
+     }
+   if (HAVE_mulsi3_mult3)
+@@ -2169,11 +2169,11 @@
+   rtx dummy = gen_rtx (SIGN_EXTEND, DImode, const0_rtx);
+   if (TARGET_64BIT && TARGET_MIPS5900)
+     {
++      /* Right to left, as the original's build compiler evaluated them.  */
++      rtx t6 = gen_reg_rtx (DImode), t5 = gen_reg_rtx (DImode);
+       emit_insn (gen_mulsidi3_64bit_r5900 (operands[0], operands[1],
+ 					   operands[2],
+-					   dummy, dummy,
+-					   gen_reg_rtx (DImode),
+-					   gen_reg_rtx (DImode)));
++					   dummy, dummy, t5, t6));
+       DONE;
+     }
+   if (TARGET_64BIT)
+@@ -2195,11 +2195,11 @@
+   rtx dummy = gen_rtx (ZERO_EXTEND, DImode, const0_rtx);
+   if (TARGET_64BIT && TARGET_MIPS5900)
+     {
++      /* Right to left, as the original's build compiler evaluated them.  */
++      rtx t6 = gen_reg_rtx (DImode), t5 = gen_reg_rtx (DImode);
+       emit_insn (gen_mulsidi3_64bit_r5900 (operands[0], operands[1],
+ 					   operands[2],
+-					   dummy, dummy, 
+-					   gen_reg_rtx (DImode),
+-					   gen_reg_rtx (DImode)));
++					   dummy, dummy, t5, t6));
+       DONE;
+     }
+   if (TARGET_64BIT)
+--- a/gcc/optabs.c
++++ b/gcc/optabs.c
+@@ -620,9 +620,12 @@
+       for (i = 0; i < GET_MODE_BITSIZE (mode) / BITS_PER_WORD; i++)
+ 	{
+ 	  rtx target_piece = operand_subword (target, i, 1, mode);
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  rtx word1 = operand_subword_force (op1, i, mode);
++#line 623
+ 	  rtx x = expand_binop (word_mode, binoptab,
+ 				operand_subword_force (op0, i, mode),
+-				operand_subword_force (op1, i, mode),
++				word1,
+ 				target_piece, unsignedp, next_methods);
+ 
+ 	  if (x == 0)
+@@ -1806,14 +1809,17 @@
+ 	    {
+ 	      register rtx t0 = gen_reg_rtx (wider_mode);
+ 	      register rtx t1 = gen_reg_rtx (wider_mode);
++	      /* Arguments right to left, as on the original's i386 host.  */
++	      rtx wide1 = convert_modes (wider_mode, mode, op1, unsignedp);
++#line 1809
+ 
+ 	      if (expand_twoval_binop (binoptab,
+ 				       convert_modes (wider_mode, mode, op0,
+ 						      unsignedp),
+-				       convert_modes (wider_mode, mode, op1,
+-						      unsignedp),
++				       wide1,
+ 				       t0, t1, unsignedp))
+ 		{
++#line 1817
+ 		  convert_move (targ0, t0, unsignedp);
+ 		  convert_move (targ1, t1, unsignedp);
+ 		  return 1;
+--- a/gcc/function.c
++++ b/gcc/function.c
+@@ -4757,14 +4757,21 @@
+ 	      if (promoted_mode != nominal_mode)
+ 		{
+ 		  push_to_sequence (conversion_insns);
+-		  emit_move_insn (validize_mem (stack_parm),
+-				  validize_mem (entry_parm));
++		  /* Arguments right to left, as on the original's i386 host:
++		     ENTRY_PARM's address may need a pseudo first.  */
++		  entry_parm = validize_mem (entry_parm);
++		  emit_move_insn (validize_mem (stack_parm), entry_parm);
++#line 4762
+ 		  conversion_insns = get_insns ();
+ 		  end_sequence ();
+ 		}
+ 	      else
+-		emit_move_insn (validize_mem (stack_parm),
+-				validize_mem (entry_parm));
++		{
++		  /* Likewise.  */
++		  entry_parm = validize_mem (entry_parm);
++		  emit_move_insn (validize_mem (stack_parm), entry_parm);
++		}
++#line 4768
+ 	    }
+ 	  if (current_function_check_memory_usage)
+ 	    {
+--- a/gcc/integrate.c
++++ b/gcc/integrate.c
+@@ -1754,7 +1754,11 @@
+      REG_FUNCTION_RETURN_VALUE_P.  */
+ 
+   map->inline_target = 0;
+-  loc = DECL_RTL (DECL_RESULT (fndecl));
++  /* After errors DECL_RESULT can be null here (g++.law/inline2.C at -O2). The original loads LOC at this
++     point whatever TYPE is, takes SIGSEGV and bails out; clang moves the load into the branches that use
++     LOC, so a void function went on. Load it here.  */
++  loc = *(rtx volatile *) &DECL_RTL (DECL_RESULT (fndecl));
++#line 1758
+   if (TYPE_MODE (type) == VOIDmode)
+     /* There is no return value to worry about.  */
+     ;
+@@ -2707,10 +2711,15 @@
+ #ifndef NO_FUNCTION_CSE
+       if (! (optimize && ! flag_no_function_cse))
+ #endif
+-	return gen_rtx_CALL (GET_MODE (orig),
+-			     gen_rtx_MEM (GET_MODE (XEXP (orig, 0)),
+-					  copy_rtx_and_substitute (XEXP (XEXP (orig, 0), 0), map)),
+-			copy_rtx_and_substitute (XEXP (orig, 1), map));
++	{
++	  /* Arguments right to left, as on the original's i386 host.  */
++	  rtx op1 = copy_rtx_and_substitute (XEXP (orig, 1), map);
++	  return gen_rtx_CALL (GET_MODE (orig),
++			       gen_rtx_MEM (GET_MODE (XEXP (orig, 0)),
++					    copy_rtx_and_substitute (XEXP (XEXP (orig, 0), 0), map)),
++			       op1);
++	}
++#line 2714
+       break;
+ 
+ #if 0
+--- a/gcc/combine.c
++++ b/gcc/combine.c
+@@ -7475,15 +7475,20 @@
+      won't match a pattern either with or without this.  */
+ 
+   if (GET_CODE (varop) == IOR || GET_CODE (varop) == XOR)
+-    return
+-      gen_lowpart_for_combine
+-	(mode,
+-	 apply_distributive_law
+-	 (gen_binary (GET_CODE (varop), GET_MODE (varop),
+-		      simplify_and_const_int (NULL_RTX, GET_MODE (varop),
+-					      XEXP (varop, 0), constop),
+-		      simplify_and_const_int (NULL_RTX, GET_MODE (varop),
+-					      XEXP (varop, 1), constop))));
++    {
++      /* Arguments right to left, as on the original's i386 host.  */
++      rtx op1 = simplify_and_const_int (NULL_RTX, GET_MODE (varop),
++					XEXP (varop, 1), constop);
++      return
++	gen_lowpart_for_combine
++	  (mode,
++	   apply_distributive_law
++	   (gen_binary (GET_CODE (varop), GET_MODE (varop),
++			simplify_and_const_int (NULL_RTX, GET_MODE (varop),
++						XEXP (varop, 0), constop),
++			op1)));
++    }
++#line 7487
+ 
+   /* Get VAROP in MODE.  Try to get a SUBREG if not.  Don't make a new SUBREG
+      if we already had one (just check for the simplest cases).  */
+--- a/gcc/c-common.c
++++ b/gcc/c-common.c
+@@ -2805,11 +2805,14 @@
+   if (TREE_CODE (TREE_TYPE (expr)) == COMPLEX_TYPE)
+     {
+       tree tem = save_expr (expr);
++      /* Arguments right to left, as on the original's i386 host.  */
++      tree imag = truthvalue_conversion (build_unary_op (IMAGPART_EXPR, tem, 0));
++#line 2808
+       return (build_binary_op
+ 	      ((TREE_SIDE_EFFECTS (expr)
+ 		? TRUTH_OR_EXPR : TRUTH_ORIF_EXPR),
+ 	       truthvalue_conversion (build_unary_op (REALPART_EXPR, tem, 0)),
+-	       truthvalue_conversion (build_unary_op (IMAGPART_EXPR, tem, 0)),
++	       imag,
+ 	       0));
+     }
+ 
+--- a/gcc/toplev.c
++++ b/gcc/toplev.c
+@@ -2474,6 +2474,21 @@
+   fatal ("output pipe has been closed");
+ }
+ 
++#ifdef SIGBUS
++/* Handler for SIGBUS. The original's host, i386 Linux, reports every bad memory access as SIGSEGV, and
++   the driver prints the signal's number; macOS reports some as SIGBUS (c-torture 950922-1.c). So die
++   of SIGSEGV.  */
++
++static void
++bus_signal (signo)
++     int signo ATTRIBUTE_UNUSED;
++{
++  signal (SIGSEGV, SIG_DFL);
++  raise (SIGSEGV);
++}
++#endif
++
++#line 2477
+ /* Strip off a legitimate source ending from the input string NAME of
+    length LEN.  Rather than having to know the names used by all of
+    our front ends, we strip off an ending of a period followed by
+@@ -4828,6 +4843,10 @@
+ #ifdef SIGPIPE
+   signal (SIGPIPE, pipe_closed);
+ #endif
++#ifdef SIGBUS
++  signal (SIGBUS, bus_signal);
++#endif
++#line 4831
+ 
+   decl_printable_name = decl_name;
+   lang_expand_expr = (lang_expand_expr_t) do_abort;
