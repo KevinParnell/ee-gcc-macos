@@ -1,0 +1,344 @@
+Host port of EE-GCC 2.9-ee-991111-01 (GirianSeed/ee-gcc src.tar.gz + Sony's sce-patch) to 64-bit macOS,
+built with Apple clang: arm64 (x86_64 builds but is not verified). Apply with `patch -p1` in src/, then copy
+xm-darwin.h to gcc/config/. What each part is for:
+
+1. config.sub, gcc/config.sub, gcc/configure: accept aarch64/x86_64-apple-darwin hosts (xm-darwin.h).
+2. libiberty/strerror.c: hide the SDK's `const int sys_nerr` like sys_errlist. include/obstack.h: no lvalue
+   casts (modern C rejects them; same expansion otherwise).
+3. gcc/expr.h, gcc/expr.c: the generated gen_* functions are K&R (non-variadic) but were called through
+   `rtx (*)(rtx, ...)`. On Apple arm64 variadic arguments go on the stack, so the operands arrived as garbage
+   (cc1 crashed on `return a + b;`). Unprototyped pointers, as genoutput.c itself declares the table.
+4. LONG32: `long' is 32 bits on the original i386 host and 64 here. HOST_WIDE_INT is `long long' on both (the
+   r5900 target forces it) and float folding is software (REAL_ARITHMETIC), so only these differ:
+   - gcc/real.c endian(): 32-bit target words are returned sign-extended, as a 32-bit `long' holds them. The
+     original therefore folds `union { double d; long long l; } u; u.d = 1.1; return u.l;` to
+     0xffffffff9999999a (its operand_subword ORs in the sign-extended low word); this reproduces that.
+   - gcc/config/mips/mips.c: the words (and a large-frame offset) are printed as 32-bit values again.
+   - gcc/dbxout.c: stabs type ranges switch to octal at gdb's 32-bit `long' (`int:t1=r1;0000...;').
+5. Three latent bugs found with AddressSanitizer, each reading or writing past an object, so their effect
+   depended on the host's memory layout:
+   - gcc/haifa-sched.c init_rgn_data_dependences(): the int array bb_pending_lists_length was cleared with
+     n * sizeof (rtx), i.e. n * 8 bytes here and past the end of its alloca; n * 4 on the original.
+   - gcc/jump.c delete_barrier_successors(): SET_SRC/SET_DEST of a jump's pattern were read without checking
+     that the pattern is a SET (a RETURN or ADDR_VEC has fewer operands, so the next object was read).
+   - gcc/loop.c find_and_verify_loops(): a LOOP_CONT note outside any loop was stored at
+     loop_number_loop_cont[-1]. In the original's packed alloca blocks (n * 4 bytes each, seen in its
+     disassembly) that is loop_number_cont_dominator[max_loop_num - 1]; it is stored there now.
+
+--- a/config.sub
++++ b/config.sub
+@@ -264,7 +264,7 @@
+ 		exit 1
+ 		;;
+ 	# Recognize the basic CPU types with company name.
+-	vax-* | tahoe-* | i[34567]86-* | i860-* | m32r-* | m68k-* | m68000-* \
++	aarch64-* | x86_64-* | vax-* | tahoe-* | i[34567]86-* | i860-* | m32r-* | m68k-* | m68000-* \
+ 	      | m88k-* | sparc-* | ns32k-* | fx80-* | arc-* | arm-* | c[123]* \
+ 	      | mips-* | pyramid-* | tron-* | a29k-* | romp-* | rs6000-* \
+ 	      | power-* | none-* | 580-* | cray2-* | h8300-* | i960-* \
+@@ -995,7 +995,7 @@
+ 	# The portable systems comes first.
+ 	# Each alternative MUST END IN A *, to match a version number.
+ 	# -sysv* is not here because it comes later, after sysvr4.
+-	-gnu* | -bsd* | -mach* | -minix* | -genix* | -ultrix* | -irix* \
++	-darwin* | -gnu* | -bsd* | -mach* | -minix* | -genix* | -ultrix* | -irix* \
+ 	      | -*vms* | -sco* | -esix* | -isc* | -aix* | -sunos | -sunos[34]*\
+ 	      | -hpux* | -unos* | -osf* | -luna* | -dgux* | -solaris* | -sym* \
+ 	      | -amigaos* | -amigados* | -msdos* | -newsos* | -unicos* | -aof* \
+--- a/gcc/config.sub
++++ b/gcc/config.sub
+@@ -239,7 +239,7 @@
+ 		exit 1
+ 		;;
+ 	# Recognize the basic CPU types with company name.
+-	vax-* | tahoe-* | i[34567]86-* | i860-* | m32r-* | m68k-* | m68000-* \
++	aarch64-* | x86_64-* | vax-* | tahoe-* | i[34567]86-* | i860-* | m32r-* | m68k-* | m68000-* \
+ 	      | m88k-* | sparc-* | ns32k-* | fx80-* | arc-* | arm-* | c[123]* \
+ 	      | mips-* | pyramid-* | tron-* | a29k-* | romp-* | rs6000-* \
+ 	      | power-* | none-* | 580-* | cray2-* | h8300-* | i960-* \
+@@ -929,7 +929,7 @@
+ 	# The portable systems comes first.
+ 	# Each alternative MUST END IN A *, to match a version number.
+ 	# -sysv* is not here because it comes later, after sysvr4.
+-	-gnu* | -bsd* | -mach* | -minix* | -genix* | -ultrix* | -irix* \
++	-darwin* | -gnu* | -bsd* | -mach* | -minix* | -genix* | -ultrix* | -irix* \
+ 	      | -*vms* | -sco* | -esix* | -isc* | -aix* | -sunos | -sunos[34]*\
+ 	      | -hpux* | -unos* | -osf* | -luna* | -dgux* | -solaris* | -sym* \
+ 	      | -amigaos* | -amigados* | -msdos* | -newsos* | -unicos* | -aof* \
+--- a/gcc/configure
++++ b/gcc/configure
+@@ -5773,6 +5773,11 @@
+ 		use_collect2=yes
+ 		;;
+ 		# END CYGNUS LOCAL
++	aarch64-apple-darwin* | arm64-apple-darwin* | x86_64-apple-darwin*)	# macOS (LP64) hosts
++		xm_file=xm-darwin.h
++		xm_defines="HAVE_ATEXIT POSIX BSTRING"
++		fixincludes=Makefile.in
++		;;
+ # This hasn't been upgraded to GCC 2.
+ 	*)
+ 		echo "Configuration $machine not supported" 1>&2
+--- a/libiberty/strerror.c
++++ b/libiberty/strerror.c
+@@ -14,6 +14,7 @@
+    attributes.  So we hide the declaration in errno.h (if any) using a
+    macro. */
+ #define sys_errlist sys_errlist__
++#define sys_nerr sys_nerr__
+ #endif
+ 
+ #include <stdio.h>
+@@ -21,6 +22,7 @@
+ 
+ #ifdef HAVE_SYS_ERRLIST
+ #undef sys_errlist
++#undef sys_nerr
+ #endif
+ 
+ /*  Routines imported from standard C runtime libraries. */
+--- a/include/obstack.h
++++ b/include/obstack.h
+@@ -417,7 +417,8 @@
+ ({ struct obstack *__o = (OBSTACK);					\
+    if (__o->next_free + sizeof (void *) > __o->chunk_limit)		\
+      _obstack_newchunk (__o, sizeof (void *));				\
+-   *((void **)__o->next_free)++ = ((void *)datum);			\
++   *((void **)__o->next_free) = ((void *)datum);			\
++   __o->next_free += sizeof (void *);			\
+    (void) 0; })
+ 
+ # define obstack_int_grow(OBSTACK,datum)				\
+@@ -425,11 +426,12 @@
+ ({ struct obstack *__o = (OBSTACK);					\
+    if (__o->next_free + sizeof (int) > __o->chunk_limit)		\
+      _obstack_newchunk (__o, sizeof (int));				\
+-   *((int *)__o->next_free)++ = ((int)datum);				\
++   *((int *)__o->next_free) = ((int)datum);				\
++   __o->next_free += sizeof (int);				\
+    (void) 0; })
+ 
+-# define obstack_ptr_grow_fast(h,aptr) (*((void **) (h)->next_free)++ = (void *)aptr)
+-# define obstack_int_grow_fast(h,aint) (*((int *) (h)->next_free)++ = (int) aint)
++# define obstack_ptr_grow_fast(h,aptr) (*((void **) (((h)->next_free += sizeof (void *)) - sizeof (void *))) = (void *)aptr)
++# define obstack_int_grow_fast(h,aint) (*((int *) (((h)->next_free += sizeof (int)) - sizeof (int))) = (int) aint)
+ 
+ # define obstack_blank(OBSTACK,length)					\
+ __extension__								\
+@@ -537,7 +539,7 @@
+   (*((int *) (((h)->next_free+=sizeof(int))-sizeof(int))) = ((int) datum)))
+ 
+ # define obstack_ptr_grow_fast(h,aptr) (*((char **) (h)->next_free)++ = (char *) aptr)
+-# define obstack_int_grow_fast(h,aint) (*((int *) (h)->next_free)++ = (int) aint)
++# define obstack_int_grow_fast(h,aint) (*((int *) (((h)->next_free += sizeof (int)) - sizeof (int))) = (int) aint)
+ 
+ # define obstack_blank(h,length)					\
+ ( (h)->temp = (length),							\
+--- a/gcc/expr.h
++++ b/gcc/expr.h
+@@ -376,7 +376,7 @@
+ #define GEN_FCN(CODE) (*insn_gen_function[(int) (CODE)])
+ #endif
+ 
+-extern rtx (*const insn_gen_function[]) PROTO ((rtx, ...));
++extern rtx (*const insn_gen_function[]) ();
+ 
+ extern optab add_optab;
+ extern optab sub_optab;
+--- a/gcc/expr.c
++++ b/gcc/expr.c
+@@ -155,10 +155,10 @@
+ static rtx enqueue_insn		PROTO((rtx, rtx));
+ static void init_queue		PROTO((void));
+ static int move_by_pieces_ninsns PROTO((unsigned int, int));
+-static void move_by_pieces_1	PROTO((rtx (*) (rtx, ...), enum machine_mode,
++static void move_by_pieces_1	PROTO((rtx (*) (), enum machine_mode,
+ 				       struct move_by_pieces *));
+ static void clear_by_pieces	PROTO((rtx, int, int));
+-static void clear_by_pieces_1	PROTO((rtx (*) (rtx, ...), enum machine_mode,
++static void clear_by_pieces_1	PROTO((rtx (*) (), enum machine_mode,
+ 				       struct clear_by_pieces *));
+ static int is_zeros_p		PROTO((tree));
+ static int mostly_zeros_p	PROTO((tree));
+@@ -1588,7 +1588,7 @@
+ 
+ static void
+ move_by_pieces_1 (genfun, mode, data)
+-     rtx (*genfun) PROTO ((rtx, ...));
++     rtx (*genfun) ();
+      enum machine_mode mode;
+      struct move_by_pieces *data;
+ {
+@@ -2351,7 +2351,7 @@
+ 
+ static void
+ clear_by_pieces_1 (genfun, mode, data)
+-     rtx (*genfun) PROTO ((rtx, ...));
++     rtx (*genfun) ();
+      enum machine_mode mode;
+      struct clear_by_pieces *data;
+ {
+--- a/gcc/real.c
++++ b/gcc/real.c
+@@ -478,14 +478,14 @@
+ 	  th = (unsigned long) e[6] & 0xffff;
+ 	  t = (unsigned long) e[7] & 0xffff;
+ 	  t |= th << 16;
+-	  x[3] = (long) t;
++	  x[3] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 
+ 	case XFmode:
+ 	  /* Swap halfwords in the third long.  */
+ 	  th = (unsigned long) e[4] & 0xffff;
+ 	  t = (unsigned long) e[5] & 0xffff;
+ 	  t |= th << 16;
+-	  x[2] = (long) t;
++	  x[2] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  /* fall into the double case */
+ 
+ 	case DFmode:
+@@ -493,7 +493,7 @@
+ 	  th = (unsigned long) e[2] & 0xffff;
+ 	  t = (unsigned long) e[3] & 0xffff;
+ 	  t |= th << 16;
+-	  x[1] = (long) t;
++	  x[1] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  /* fall into the float case */
+ 
+ 	case SFmode:
+@@ -502,7 +502,7 @@
+ 	  th = (unsigned long) e[0] & 0xffff;
+ 	  t = (unsigned long) e[1] & 0xffff;
+ 	  t |= th << 16;
+-	  x[0] = (long) t;
++	  x[0] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  break;
+ 
+ 	default:
+@@ -520,7 +520,7 @@
+ 	  th = (unsigned long) e[7] & 0xffff;
+ 	  t = (unsigned long) e[6] & 0xffff;
+ 	  t |= th << 16;
+-	  x[3] = (long) t;
++	  x[3] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 
+ 	case XFmode:
+ 	  /* Pack the third long.
+@@ -529,7 +529,7 @@
+ 	  th = (unsigned long) e[5] & 0xffff;
+ 	  t = (unsigned long) e[4] & 0xffff;
+ 	  t |= th << 16;
+-	  x[2] = (long) t;
++	  x[2] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  /* fall into the double case */
+ 
+ 	case DFmode:
+@@ -537,7 +537,7 @@
+ 	  th = (unsigned long) e[3] & 0xffff;
+ 	  t = (unsigned long) e[2] & 0xffff;
+ 	  t |= th << 16;
+-	  x[1] = (long) t;
++	  x[1] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  /* fall into the float case */
+ 
+ 	case SFmode:
+@@ -546,7 +546,7 @@
+ 	  th = (unsigned long) e[1] & 0xffff;
+ 	  t = (unsigned long) e[0] & 0xffff;
+ 	  t |= th << 16;
+-	  x[0] = (long) t;
++	  x[0] = (long) (int) t;  /* LONG32: as a 32-bit `long' would hold it */
+ 	  break;
+ 
+ 	default:
+--- a/gcc/config/mips/mips.c
++++ b/gcc/config/mips/mips.c
+@@ -5691,7 +5691,8 @@
+   REAL_VALUE_TO_TARGET_DOUBLE (value, value_long);
+ 
+   fprintf (stream, "\t.word\t0x%08lx\t\t# %.20g\n\t.word\t0x%08lx\n",
+-	   value_long[0], value, value_long[1]);
++	   (long) (unsigned int) value_long[0], value,
++	   (long) (unsigned int) value_long[1]);  /* LONG32 */
+ #else
+   fprintf (stream, "\t.double\t%.20g\n", value);
+ #endif
+@@ -5709,7 +5710,8 @@
+   long value_long;
+   REAL_VALUE_TO_TARGET_SINGLE (value, value_long);
+ 
+-  fprintf (stream, "\t.word\t0x%08lx\t\t# %.12g (float)\n", value_long, value);
++  fprintf (stream, "\t.word\t0x%08lx\t\t# %.12g (float)\n",
++	   (long) (unsigned int) value_long, value);  /* LONG32 */
+ #else
+   fprintf (stream, "\t.float\t%.12g\n", value);
+ #endif
+@@ -6154,7 +6156,7 @@
+ 	  else
+ 	    {
+ 	      fprintf (file, "\tli\t%s,0x%.08lx\t# ",
+-		       reg_names[MIPS_TEMP2_REGNUM], (long) base_offset);
++		       reg_names[MIPS_TEMP2_REGNUM], (long) (unsigned int) base_offset);  /* LONG32 */
+ 	      fprintf (file, HOST_WIDE_INT_PRINT_DEC, base_offset);
+ 	      fprintf (file, "\n\t%s\t%s,%s,%s\n",
+ 		       Pmode == DImode ? "daddu" : "addu",
+@@ -6377,7 +6379,7 @@
+ 	  else
+ 	    {
+ 	      fprintf (file, "\tli\t%s,0x%.08lx\t# ",
+-		       reg_names[MIPS_TEMP2_REGNUM], (long) base_offset);
++		       reg_names[MIPS_TEMP2_REGNUM], (long) (unsigned int) base_offset);  /* LONG32 */
+ 	      fprintf (file, HOST_WIDE_INT_PRINT_DEC, base_offset);
+ 	      fprintf (file, "\n\t%s\t%s,%s,%s\n",
+ 		       Pmode == DImode ? "daddu" : "addu",
+--- a/gcc/dbxout.c
++++ b/gcc/dbxout.c
+@@ -1176,7 +1176,7 @@
+ 	 long (it has no concept of HOST_BITS_PER_WIDE_INT).  */
+       else if (use_gnu_debug_info_extensions
+ 	       && (TYPE_PRECISION (type) > TYPE_PRECISION (integer_type_node)
+-		   || TYPE_PRECISION (type) >= HOST_BITS_PER_LONG))
++		   || TYPE_PRECISION (type) >= 32))  /* LONG32: gdb's `long', 32 bits on the original host */
+ 	{
+ 	  /* This used to say `r1' and we used to take care
+ 	     to make sure that `int' was type number 1.  */
+--- a/gcc/haifa-sched.c
++++ b/gcc/haifa-sched.c
+@@ -7080,7 +7080,7 @@
+   bzero ((char *) bb_pending_read_mems, n_bbs * sizeof (rtx));
+   bzero ((char *) bb_pending_write_insns, n_bbs * sizeof (rtx));
+   bzero ((char *) bb_pending_write_mems, n_bbs * sizeof (rtx));
+-  bzero ((char *) bb_pending_lists_length, n_bbs * sizeof (rtx));
++  bzero ((char *) bb_pending_lists_length, n_bbs * sizeof (int));  /* LONG32: was sizeof (rtx), 4 there */
+   bzero ((char *) bb_last_pending_memory_flush, n_bbs * sizeof (rtx));
+   bzero ((char *) bb_last_function_call, n_bbs * sizeof (rtx));
+   bzero ((char *) bb_sched_before_next_call, n_bbs * sizeof (rtx));
+--- a/gcc/jump.c
++++ b/gcc/jump.c
+@@ -2261,6 +2261,7 @@
+ 	 gcse.  We eliminate such insns now to avoid having them
+ 	 cause problems later.  */
+       else if (GET_CODE (insn) == JUMP_INSN
++	       && GET_CODE (PATTERN (insn)) == SET  /* else the next object's memory was read */
+ 	       && SET_SRC (PATTERN (insn)) == pc_rtx
+ 	       && SET_DEST (PATTERN (insn)) == pc_rtx)
+ 	insn = delete_insn (insn);
+--- a/gcc/loop.c
++++ b/gcc/loop.c
+@@ -2628,7 +2628,15 @@
+ 	    break;
+ 
+ 	  case NOTE_INSN_LOOP_CONT:
+-	    loop_number_loop_cont[current_loop] = insn;
++	    if (current_loop >= 0)
++	      loop_number_loop_cont[current_loop] = insn;
++	    else
++	      /* A LOOP_CONT note outside any loop.  The original stored it at
++		 loop_number_loop_cont[-1]: on its i386 host the alloca blocks
++		 are packed, n * 4 bytes each, so that is the last element of
++		 loop_number_cont_dominator, allocated just below.  Do that
++		 here too instead of writing outside the block.  */
++	      loop_number_cont_dominator[max_loop_num - 1] = insn;
+ 	    break;
+ 	  case NOTE_INSN_LOOP_END:
+ 	    if (current_loop == -1)
