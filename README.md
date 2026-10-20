@@ -1,6 +1,6 @@
-# EE-GCC 2.9-ee-991111-01 for macOS (Apple Silicon)
+# EE-GCC 2.9-ee-991111-01 for macOS (Apple Silicon and Intel)
 
-A native arm64 build of EE-GCC 2.9-ee-991111-01, the PlayStation 2 Emotion Engine compiler from Sony's 1999 SDK,
+A native macOS build (arm64 and x86_64) of EE-GCC 2.9-ee-991111-01, the PlayStation 2 Emotion Engine compiler from Sony's 1999 SDK,
 for matching decompilation on a Mac without a Linux VM: the driver (`ee-gcc`), `cpp`, `cc1`, `cc1plus` and the
 EE assembler (`as`), built from Sony's GPL source release with a host port for 64-bit macOS. C and C++.
 
@@ -15,19 +15,25 @@ The release [`2.9-ee-991111-01-r2`](https://github.com/KevinParnell/ee-gcc-macos
   `18996eccef8b68243cdc545bb4cd7e8783645852d0fae037725d7b7c76f9b63d`: `bin/ee-gcc`,
   `lib/gcc-lib/ee/2.9-ee-991111-01/{cc1,cc1plus,cpp}`, `ee/bin/as`, `COPYING`, `COPYING.LIB`, `SOURCE.txt`. The
   layout is the Linux package's, so anything that runs `{tc}/bin/ee-gcc -c ...` works unchanged.
+- `ee-gcc-2.9-991111-01-macos-x86_64.tar.xz`, 1,737,896 bytes, sha256
+  `0f3eb10ed09e231258322ceadfabda81b342b207d7b6976fdc1b0a92fc959651`: the same build for Intel Macs
+  (`ARCH=x86_64 ./build.sh`, the same sources and patch, added to this release on 2026-10-20). **It has only been
+  run under Rosetta 2 on an Apple Silicon Mac so far, never on an Intel Mac**: the corpus results below, the
+  self-test and decomp.wtf's install were all checked that way. If it misbehaves on an Intel Mac, please open an
+  issue.
 - `ee-gcc-2.0.zip`: a copy of the source it's built from (GirianSeed/ee-gcc, release `src-2.9-ee-991111-01`,
   sha256 `99ae6c81801fa0108f436df186daefcc9101b5f402525dae75da8c5e5de728fe`).
 
 The first release, [`2.9-ee-991111-01`](https://github.com/KevinParnell/ee-gcc-macos/releases/tag/2.9-ee-991111-01),
 is C only (no `cc1plus`) and stays up for anything that pins it.
 
-It runs on macOS 11 or newer on Apple Silicon. The binaries are ad-hoc signed and link only libSystem.
+It runs on macOS 11 or newer. The binaries are ad-hoc signed and link only libSystem.
 
 ## Verification
 
 All 6,614 corpus compiles that the original completes (3,379 C, 3,235 C++) give byte-identical objects and
 byte-identical `-S` output with the native build, compared raw: every section, the symbol table and the
-relocations. That covers -O0 to -O3, -G0 and -G8, `-g`, and C++ with and without exceptions and RTTI. Every case
+relocations. Both builds give these results, arm64 natively and x86_64 under Rosetta 2. That covers -O0 to -O3, -G0 and -G8, `-g`, and C++ with and without exceptions and RTTI. Every case
 the original rejects (1,973 of the 8,587), the native build rejects too, with the same messages. The corpus is
 CC0 demo programs, zlib 1.1.4, generated torture cases, gcc.c-torture, g++.old-deja and C++ torture cases.
 
@@ -35,7 +41,8 @@ CC0 demo programs, zlib 1.1.4, generated torture cases, gcc.c-torture, g++.old-d
 
     ./build.sh WORKDIR [PREFIX]
 
-About two minutes on an M-series Mac, with only Apple's command-line tools. It downloads the source zip (sha256
+About two minutes on an M-series Mac, with only Apple's command-line tools (`ARCH=x86_64 ./build.sh` builds the
+Intel one; on Apple Silicon its self-test then runs under Rosetta). It downloads the source zip (sha256
 pinned), applies Sony's `sce-patch` and `2.9-ee-991111-01/mac-host.patch`, configures as Sony did
 (`--target=ee --enable-c-cpplib`), builds with Apple clang, installs to PREFIX (default
 `WORKDIR/ee-gcc-2.9-ee-991111-01`), and fails unless `tools/selftest.c` and `tools/selftest.cc` compile to the
@@ -43,7 +50,7 @@ original compiler's objects. Then
 
     python3 -I tools/pack.py PREFIX ee-gcc-2.9-991111-01-macos-arm64.tar.xz
 
-packs it reproducibly: the same sha256 as the release.
+packs it reproducibly: the same sha256 as the release (`-macos-x86_64.tar.xz` for the Intel build).
 
 ## What the port changes (`2.9-ee-991111-01/mac-host.patch`)
 
@@ -79,7 +86,6 @@ the host) and checks `tm.h`.
 
 ## Not done
 
-- **Intel Macs**: `ARCH=x86_64 ./build.sh` builds and passes the same checks, but isn't part of this release.
 - **2.96 (2.96-ee-001003-1)**: no public source.
 
 ## License
